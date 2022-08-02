@@ -1,0 +1,37 @@
+RAM Allocation [bytes]
+Variable                                                                          Address   Size
+------------------------------------------------------------------------------------------------
+data                                                                              0x0080       9
+num                                                                               0x0089       4
+rom_code                                                                          0x008D      27
+chars                                                                             0x00A8      14
+time_on                                                                           0x00B6       1
+time_worked                                                                       0x00B7       1
+
+EEPROM Allocation [bytes]
+Variable                                                                          Address   Size
+------------------------------------------------------------------------------------------------
+swap                                                                              0x0000       1
+
+Register Allocation
+Variable                                                                          Register  Size
+------------------------------------------------------------------------------------------------
+temperature                                                                       R3           1
+devices                                                                           R2           1
+flag                                                                              R5           1
+crc                                                                               R4           1
+source                                                                            R7           1
+
+FLASH Allocation [words]
+Function                                                                          Address   Size
+------------------------------------------------------------------------------------------------
+initdev                                                                           0x0004A     20
+disp_drv                                                                          0x0005E     50
+checkCRC                                                                          0x00090     39
+WD                                                                                0x000B7      9
+read_data                                                                         0x000C0     45
+conv_data                                                                         0x000ED     35
+prepare_disp_data                                                                 0x00110     39
+main                                                                              0x00137     57
+delay_3s                                                                          0x00170     60
+int0                                                                              0x001AC     37

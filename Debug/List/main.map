@@ -1,0 +1,48 @@
+RAM Allocation [bytes]
+Variable                                                                          Address   Size
+------------------------------------------------------------------------------------------------
+__ds18b20_scratch_pad                                                             0x0080       9
+temp                                                                              0x0089       4
+num                                                                               0x008D       4
+rom_code                                                                          0x0091      18
+chars                                                                             0x00A3      12
+
+EEPROM Allocation [bytes]
+Variable                                                                          Address   Size
+------------------------------------------------------------------------------------------------
+
+Register Allocation
+Variable                                                                          Register  Size
+------------------------------------------------------------------------------------------------
+var                                                                               R3           1
+devices                                                                           R2           1
+refresh                                                                           R5           1
+cnt                                                                               R4           1
+
+FLASH Allocation [words]
+Function                                                                          Address   Size
+------------------------------------------------------------------------------------------------
+initdev                                                                           0x0004D     34
+WD                                                                                0x0006F      9
+read_sens                                                                         0x00078     67
+disp_drv                                                                          0x000BB     38
+main                                                                              0x000E1     20
+delay_3s                                                                          0x000F5     17
+ds18b20_select                                                                    0x00106     26
+ds18b20_read_spd                                                                  0x00120     27
+ds18b20_temperature                                                               0x0013B     56
+ds18b20_init                                                                      0x00173     56
+
+FLASH Allocation [words]
+Function                                                                          Address   Size
+------------------------------------------------------------------------------------------------
+initdev                                                                           0x0004D     34
+WD                                                                                0x0006F      9
+read_sens                                                                         0x00078     67
+disp_drv                                                                          0x000BB     38
+main                                                                              0x000E1     20
+delay_3s                                                                          0x000F5     17
+ds18b20_select                                                                    0x00106     26
+ds18b20_read_spd                                                                  0x00120     27
+ds18b20_temperature                                                               0x0013B     56
+ds18b20_init                                                                      0x00173     56
