@@ -8,9 +8,6 @@
 #include <util/delay.h>
 #include <avr/pgmspace.h>
 
-#define delay_ms(x)  _delay_ms(x)
-#define delay_us(x)  _delay_us(x)
-
 #define SBI(BYTE,BIT)         BYTE|=(1<<BIT)
 #define CBI(BYTE,BIT)         BYTE&=~(1<<BIT)
 
@@ -28,7 +25,8 @@
 #define TIMER1_TOP_L  0x8E
 
 #define SEGMENT_DELAY_US    500
-#define DISPLAY_ON_TICKS  60/TIMER_HZ   //sec
+#define DISPLAY_OFF_TICKS  (60/TIMER_HZ)   /* сек в выкл. состоянии до включения */
+#define DISPLAY_WORK_TICKS  (15/TIMER_HZ)   /* сек в вкл. состоянии до выключения */
 #define TIMER_HZ          3
 
 #define SEG_PORT    PORTB
@@ -41,28 +39,39 @@
 #define CHK_FLAG(I) (flag & (1 << I))
 
 /* flag bits:
+   0 - BUTTON_ST   : button press pending debounce
    1 - REFRESH_ST  : trigger sensor read in main loop
    2 - SOURCE_ST   : active sensor (0=ROOM, 1=OUT)
    3 - ERROR_ST    : sensor 0 CRC error
    4 - ERROR_ST+1  : sensor 1 CRC error
+   5 - TOGGLE_ST   : pending source switch (set in main, cleared in ISR)
    7 - STATE_ON    : display enabled                 */
+#define BUTTON_ST   0
 #define REFRESH_ST  1
 #define SOURCE_ST   2
 #define ERROR_ST    3
+#define TOGGLE_ST   5
 #define STATE_ON    7
+#define SENSOR_ERR(idx)  (ERROR_ST + (idx))   /* бит ошибки датчика idx */
 
 signed char   temperature;
 
 volatile unsigned char flag = 0;
 
-unsigned char sensor_count,
-              scratchpad[9],
-              crc_buf,
-              sensor_idx,
-              digits[4],
-              rom_code[2][9];
+#define DIG_UNITS  0            /* позиция единиц */
+#define DIG_TENS   1            /* позиция десятков */
+#define DIG_HI     2            /* позиция сотен или знака '-' */
+
+unsigned char sensor_count,        /* количество найденных датчиков (0..2) */
+              sensor_idx,           /* индекс активного датчика (0=ROOM, 1=OUT) */
+              digits[3],            /* цифры дисплея [DIG_UNITS/DIG_TENS/DIG_HI] */
+              rom_code[2][9];       /* ROM-коды датчиков: [0..1][0..7]=ROM, [8]=CRC */
 
 /* Таблица сегментов во флеше — экономит 14 байт из 128 байт RAM */
+#define CHAR_MINUS  10   /* '-' */
+#define CHAR_DEG    11   /* '°' */
+#define CHAR_E      12   /* 'E' */
+#define CHAR_R      13   /* 'r' */
 static const unsigned char chars[14] PROGMEM = {
                0xBE,  //  0
                0x0A,  //  1
@@ -79,9 +88,6 @@ static const unsigned char chars[14] PROGMEM = {
                0xF4,  //  E
                0xC0   //  r
               };
-
-volatile unsigned char source_toggle  = 0;
-volatile unsigned char button_pending = 0;  /* выставляется в ISR, обрабатывается в main */
 
 /* ================================================================
  * 1-Wire driver (software bit-bang, pin PB0)
@@ -240,76 +246,114 @@ unsigned char w1_search(unsigned char cmd, unsigned char rom_codes[][9])
     return found;
 }
 
-void hw_init()
+void hw_init(void)
 {
-    DDRB = 0xFE;
+    /* PORTB: PB0 = 1-Wire (input, внешний pull-up)
+              PB1..PB7 = выходы сегментов */
+    DDRB  = (1<<PB7)|(1<<PB6)|(1<<PB5)|(1<<PB4)|(1<<PB3)|(1<<PB2)|(1<<PB1);
     PORTB = 0x00;
 
-    DDRD = 0x78;
+    /* PORTD: PD2 = кнопка INT0 (вход)
+              PD3,PD4,PD5 = управление анодами цифр
+              PD6 = выход (не используется, подтянут к GND) */
+    DDRD  = (1<<PD6)|(1<<PD5)|(1<<PD4)|(1<<PD3);
     PORTD = 0x00;
 
-    TIMSK  = 0x40;
-    TCCR1B = 0x05;
+    /* Timer1: CTC-режим (WGM12), prescaler=1024
+       TCNT1 сбрасывается аппаратно при совпадении с OCR1A → период ≈ 3с */
+    TIMSK  = (1 << OCIE1A);
+    TCCR1B = (1 << WGM12) | (1 << CS12) | (1 << CS10);   /* CTC, clk/1024 */
     OCR1AH = TIMER1_TOP_H;
     OCR1AL = TIMER1_TOP_L;
 
-    GIMSK = 0x40;
-    MCUCR = 0x02;
+    /* INT0: падающий фронт (отпускание кнопки к GND) */
+    MCUCR = (1 << ISC01);
+    GIMSK = (1 << INT0);
+
+    /* Watchdog: сброс при зависании >2с */
+    cli();
+    wdt_reset();
+    wdt_enable(WDTO_2S);
+
+    /* DS18B20: ждём стабилизации питания, затем установить разрешение 9-бит (0xFF в байте конфигурации),
+       затем найти все датчики на шине */
+    _delay_ms(200);
+    w1_init();
+    w1_write(W1_CMD_SKIP_ROM);
+    w1_write(W1_CMD_WRITE_CFGROM);
+    w1_write(0x00);
+    w1_write(0x00);
+    w1_write(0xFF);
+
+    w1_init();
+    sensor_count = w1_search(W1_CMD_SEARCH_ROM, rom_code);
 }
 
 void display_update()
 {
-    if (!(flag & ((1 << ERROR_ST) | (1 << (ERROR_ST + 1)))))
+    if (!CHK_FLAG(STATE_ON)) return;
+
+    /* Показываем температуру если у текущего датчика (sensor_idx) нет CRC-ошибки.
+       При ошибке показываем "Err" (chars[13]=r, chars[12]=E). */
+    if (!CHK_FLAG(SENSOR_ERR(sensor_idx)))
     {
         DIGITS_OFF;
         DIG1_ON;
-        SEG_PORT = pgm_read_byte(&chars[digits[1]]);
-        delay_us(SEGMENT_DELAY_US);
+        SEG_PORT = pgm_read_byte(&chars[digits[DIG_UNITS]]);
+        _delay_us(SEGMENT_DELAY_US);
 
-        if (digits[2] || ((digits[3] > 0) && (digits[3] < 10)))
+        /* DIG2: показываем десятки если они ненулевые,
+           или если есть значимые сотни (нужен '0' на месте десятков) */
+        if (digits[DIG_TENS] || ((digits[DIG_HI] > 0) && (digits[DIG_HI] < 10)))
         {
             DIGITS_OFF;
             DIG2_ON;
-            SEG_PORT = pgm_read_byte(&chars[digits[2]]);
-            delay_us(SEGMENT_DELAY_US);
+            SEG_PORT = pgm_read_byte(&chars[digits[DIG_TENS]]);
+            _delay_us(SEGMENT_DELAY_US);
         }
 
-        if (digits[3])
+        if (digits[DIG_HI])
         {
             DIGITS_OFF;
             DIG3_ON;
-            SEG_PORT = pgm_read_byte(&chars[digits[3]]);
-            delay_us(SEGMENT_DELAY_US);
+            SEG_PORT = pgm_read_byte(&chars[digits[DIG_HI]]);
+            _delay_us(SEGMENT_DELAY_US);
         }
     }
     else
     {
+        /* "Err": слева направо E→r→r на DIG3→DIG2→DIG1 */
         DIGITS_OFF;
-        DIG1_ON;
-        SEG_PORT = pgm_read_byte(&chars[13]);
-        delay_us(SEGMENT_DELAY_US);
+        DIG3_ON;
+        SEG_PORT = pgm_read_byte(&chars[CHAR_E]);
+        _delay_us(SEGMENT_DELAY_US);
 
         DIGITS_OFF;
         DIG2_ON;
-        SEG_PORT = pgm_read_byte(&chars[13]);
-        delay_us(SEGMENT_DELAY_US);
+        SEG_PORT = pgm_read_byte(&chars[CHAR_R]);
+        _delay_us(SEGMENT_DELAY_US);
 
         DIGITS_OFF;
-        DIG3_ON;
-        SEG_PORT = pgm_read_byte(&chars[12]);
-        delay_us(SEGMENT_DELAY_US);
+        DIG1_ON;
+        SEG_PORT = pgm_read_byte(&chars[CHAR_R]);
+        _delay_us(SEGMENT_DELAY_US);
     }
     DIGITS_OFF;
 }
 
-unsigned char crc_valid()
+/* crc_valid — проверяет CRC-8 (Dallas/Maxim) скретчпада DS18B20.
+ * Алгоритм: полином x^8 + x^5 + x^4 + 1 (0x31), отражённый LSB-first.
+ * Обрабатывает все 9 байт scratchpad[0..8], где [8] — сам байт CRC.
+ * При корректных данных финальный остаток равен 0.
+ * Возвращает: 1 — CRC совпал, 0 — ошибка.
+ */
+unsigned char crc_valid(unsigned char *sp)
 {
-    unsigned char a, b, i, j;
-    crc_buf = 0;
+    unsigned char a, b, i, j, crc_buf = 0;
 
     for (i = 0; i < 9; i++)
     {
-        a = scratchpad[i];
+        a = sp[i];
 
         for (j = 0; j < 8; j++)
         {
@@ -321,20 +365,41 @@ unsigned char crc_valid()
         }
     }
 
-    if (crc_buf == 0) return 1;
-    else return 0;
+    if (crc_buf == 0) { CBI(flag, SENSOR_ERR(sensor_idx)); return 1; }
+    else              { SBI(flag, SENSOR_ERR(sensor_idx)); return 0; }
 }
 
-void watchdog_init(void)
+static void sensor_refresh(void);
+void sensor_read(unsigned char *sp);
+signed char temp_convert(unsigned char *sp);
+void display_format(signed char t);
+
+static void sensor_refresh(void)
 {
-    cli();
-    wdt_reset();
-    wdt_enable(WDTO_2S);   /* WDP2|WDP0 = 0b101 ≈ 2s */
+    unsigned char scratchpad[9];
+    if (!CHK_FLAG(REFRESH_ST)) return;
+    sensor_idx = CHK_FLAG(SOURCE_ST) ? 1 : 0;
+    sensor_read(scratchpad);
+    if (crc_valid(scratchpad))
+    {
+        temperature = temp_convert(scratchpad);
+        display_format(temperature);
+    }
+    CBI(flag, REFRESH_ST);
 }
 
-void sensor_read()
+static void button_debounce(void)
 {
-    unsigned char i = 0;
+    if (!CHK_FLAG(BUTTON_ST)) return;
+    CBI(flag, BUTTON_ST);
+    _delay_ms(50);
+    if (!(PIND & (1 << PD2)))
+        SBI(flag, TOGGLE_ST);
+}
+
+void sensor_read(unsigned char *sp)
+{
+    unsigned char i = 0, t;
 
     if (sensor_count == 1) sensor_idx = 0;
 
@@ -345,7 +410,8 @@ void sensor_read()
         w1_write(W1_CMD_CONVERT);
         /* таймаут 1с: DS18B20 конвертирует макс 750мс. При зависании
            CRC провалится → error_flag выставится штатно.           */
-        { unsigned char i; for (i = 0; i < 200 && !(PINB & (1 << PB0)); i++) delay_ms(5); }
+        for (t = 0; t < 200 && !w1_sample(); t++)
+            _delay_ms(5);
 
         w1_init();
         w1_write(W1_CMD_MATCH_ROM);
@@ -356,135 +422,95 @@ void sensor_read()
         w1_write(W1_CMD_READ_SCRATCH);
 
         for (i = 0; i < 9; i++)
-            scratchpad[i] = w1_read();
+            sp[i] = w1_read();
 
         w1_init();
     }
 }
 
-signed char temp_convert()
+/* temp_convert — декодирует сырые данные DS18B20 в градусы Цельсия.
+ * Формат scratchpad[1:0]: знаковое 16-битное, шаг 1/16°C.
+ * Биты [3:0] — дробная часть, сдвиг >>4 отбрасывает её.
+ * Диапазон: -55..+125°C, возвращает целые градусы.
+ */
+signed char temp_convert(unsigned char *sp)
 {
-    signed int raw = (signed int)((unsigned int)scratchpad[1] << 8 | scratchpad[0]);
+    signed int raw = (signed int)((unsigned int)sp[1] << 8 | sp[0]);
     return (signed char)(raw >> 4);
 }
 
-void display_format()
+/* display_format — раскладывает temperature по цифрам дисплея.
+ * digits[DIG_UNITS] = единицы, digits[DIG_TENS] = десятки, digits[DIG_HI] = сотни или знак '-'.
+ * Для отрицательных чисел digits[DIG_HI] = 10 (индекс символа '-' в chars[]).
+ */
+void display_format(signed char t)
 {
-    signed char t = temperature;  /* локальная копия — не портим глобал */
 
     if (t < 0)
     {
-        digits[3] = 10;
-        t = ~t;
-        t += 1;
+        digits[DIG_HI] = CHAR_MINUS;
+        t = -t;   /* two's complement: получаем |t| */
     }
     else
     {
-        if (t / 100) { digits[3] = t / 100; t = t - 100; }
-        else digits[3] = 0;
+        digits[DIG_HI] = t / 100;   /* 0 или 1 (макс +125°C) */
+        t %= 100;
     }
 
-    digits[2] = (t / 10) % 10;
-    digits[1] = t % 10;
+    digits[DIG_TENS]  = t / 10;     /* t < 100 после %= 100, % 10 не нужен */
+    digits[DIG_UNITS] = t % 10;
 }
 
 int main(void)
 {
     hw_init();
-    watchdog_init();
-    delay_ms(200);
-
-    TCNT1H = TIMER1_TOP_H;
-    TCNT1L = TIMER1_TOP_L;
     SBI(flag, STATE_ON);
-
-    w1_init();
-    w1_write(W1_CMD_SKIP_ROM);
-    w1_write(W1_CMD_WRITE_CFGROM);
-    w1_write(0x00);
-    w1_write(0x00);
-    w1_write(0xFF);
-
-    w1_init();
-    sensor_count = w1_search(W1_CMD_SEARCH_ROM, rom_code);
+    SBI(flag, REFRESH_ST);
     sei();
 
     while (1)
     {
         wdt_reset();
-
-        /* Debounce: ждём 50мс и перечитываем пин.
-           Если дребезг дал ложный фронт — пин уже высокий, игнор. */
-        if (button_pending)
-        {
-            button_pending = 0;
-            delay_ms(50);
-            if (!(PIND & (1 << PD2)))
-                source_toggle = ~source_toggle;
-        }
-
-        if (CHK_FLAG(REFRESH_ST))
-        {
-            sensor_idx = CHK_FLAG(SOURCE_ST) >> 2;
-            CBI(flag, (sensor_idx + ERROR_ST));
-            sensor_read();
-            crc_buf = crc_valid();
-
-            if (crc_buf)
-            {
-                temperature = temp_convert();
-                display_format();
-            }
-            else SBI(flag, (sensor_idx + ERROR_ST));
-
-            CBI(flag, REFRESH_ST);
-        }
-
-        if (CHK_FLAG(STATE_ON))
-            display_update();
+        button_debounce();
+        sensor_refresh();
+        display_update();
     }
     return 0;
 }
 
 ISR(TIMER1_COMPA_vect)
 {
-    static unsigned char time_on, time_worked;
+    static unsigned char timer = 0;
 
-    /*=========================================
-                      TIMER
-    =========================================*/
-
-    if (!CHK_FLAG(STATE_ON)) time_on++;
-
-    if (time_on > DISPLAY_ON_TICKS)
+    if (CHK_FLAG(STATE_ON))
     {
-        time_on = 0;
-        SBI(flag, STATE_ON);
+        if (++timer > DISPLAY_WORK_TICKS)
+        {
+            timer = 0;
+            CBI(flag, STATE_ON);
+        }
+    }
+    else
+    {
+        if (++timer > DISPLAY_OFF_TICKS)
+        {
+            timer = 0;
+            SBI(flag, STATE_ON);
+        }
     }
 
-    if (CHK_FLAG(STATE_ON)) time_worked++;
-    if (time_worked > 4)
+    if (CHK_FLAG(TOGGLE_ST))
     {
-        time_worked = 0;
-        CBI(flag, STATE_ON);
-    }
-    /*=========================================
-    =========================================*/
-
-    if (source_toggle)
-    {
-        if (CHK_FLAG(SOURCE_ST)) CBI(flag, SOURCE_ST);
-        else SBI(flag, SOURCE_ST);
+        flag ^= (1 << SOURCE_ST);   /* toggle источника */
+        CBI(flag, TOGGLE_ST);
     }
 
     SBI(flag, REFRESH_ST);
-    TCNT1H = 0;
-    TCNT1L = 0;
 }
 
 /* Правило: в ISR только флаг. Задержка — в main(), иначе
    мультиплексинг дисплея тормозит весь экран на 50мс.       */
 ISR(INT0_vect)
 {
-    button_pending = 1;
+    SBI(flag, BUTTON_ST);
 }
