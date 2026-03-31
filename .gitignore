@@ -24,3 +24,8 @@ Release/
 # Editor backup files
 *~
 *.bak
+
+# avr-gcc build artefacts
+*.elf
+*.hex
+*.map
